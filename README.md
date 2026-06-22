@@ -14,7 +14,7 @@
 - **引导向导** — 首次使用逐步引导完成全部配置
 
 ## 截图
-
+<img width="1004" height="661" alt="image" src="https://github.com/user-attachments/assets/3cc893a0-bb07-4519-8fa9-594e2b5062c7" />
 > 运行效果见下方（请替换为实际截图）
 
 ## 技术栈
