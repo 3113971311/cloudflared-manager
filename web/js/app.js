@@ -198,17 +198,23 @@ function deleteSelectedTunnel() {
 // ═══ Domain Page ════════════════════════════════════
 function refreshDomainPage() {
   pywebview.api.get_config().then(cfg => {
-    document.getElementById('config-tunnel').textContent = cfg.current_tunnel
-      ? cfg.current_tunnel.substring(0, 12) + '...' : '未设置';
+    document.getElementById('config-tunnel').textContent = cfg.current_tunnel_name || '未设置';
+    document.getElementById('config-tunnel-id').textContent = cfg.current_tunnel
+      ? cfg.current_tunnel.substring(0, 12) + '...' : '';
     document.getElementById('config-status').textContent = cfg.has_config ? '已创建' : '未创建';
 
     const tbody = document.querySelector('#domain-table tbody');
     tbody.innerHTML = '';
     if (cfg.rules) cfg.rules.forEach(r => {
       const tr = document.createElement('tr');
-      tr.innerHTML = '<td><input type="radio" name="domain-select"></td>' +
+      tr.innerHTML = '<td><input type="checkbox" name="domain-select"></td>' +
         '<td>' + esc(r.hostname) + '</td><td>' + esc(r.service) + '</td>';
-      tr.addEventListener('click', () => tr.querySelector('input').checked = true);
+      tr.addEventListener('click', (e) => {
+        if (e.target.tagName !== 'INPUT') {
+          const cb = tr.querySelector('input');
+          cb.checked = !cb.checked;
+        }
+      });
       tbody.appendChild(tr);
     });
   });
@@ -226,23 +232,37 @@ function addDomainRule() {
   });
 }
 
-function getSelectedDomain() {
-  const r = document.querySelector('#domain-table input[name="domain-select"]:checked');
-  if (!r) return null;
-  return { hostname: r.closest('tr').cells[1].textContent };
+function getSelectedDomains() {
+  const checks = document.querySelectorAll('#domain-table input[name="domain-select"]:checked');
+  return Array.from(checks).map(cb => ({
+    hostname: cb.closest('tr').cells[1].textContent
+  }));
+}
+
+function selectAllDomains() {
+  const checks = document.querySelectorAll('#domain-table input[name="domain-select"]');
+  const allChecked = Array.from(checks).every(cb => cb.checked);
+  checks.forEach(cb => cb.checked = !allChecked);
 }
 
 function deleteDomainRule() {
-  const d = getSelectedDomain();
-  if (!d) { alert('请先选择一条规则'); return; }
-  if (!confirm('确定要删除此映射规则吗？')) return;
-  pywebview.api.delete_rule(d.hostname).then(() => refreshDomainPage());
+  const domains = getSelectedDomains();
+  if (!domains.length) { alert('请先选择一条规则'); return; }
+  const d = domains[0];
+  if (!confirm('确定要删除映射规则 "' + d.hostname + '" 吗？')) return;
+  const delDns = confirm('是否同时删除 Cloudflare 上的 DNS 解析记录？\n\n点击"确定"将同时删除 DNS，点击"取消"仅删除本地映射。');
+  pywebview.api.delete_rule(d.hostname, delDns).then(r => {
+    if (!r.success) alert(r.message);
+    refreshDomainPage();
+  });
 }
 
-function bindDns() {
-  const d = getSelectedDomain();
-  if (!d) { alert('请先选择一条域名映射规则'); return; }
-  pywebview.api.bind_dns(d.hostname).then(r => { alert(r.message); refreshDomainPage(); });
+function bindDnsSelected() {
+  const domains = getSelectedDomains();
+  if (!domains.length) { alert('请先选择域名'); return; }
+  const names = domains.map(d => d.hostname);
+  if (!confirm('确定要批量绑定 ' + names.length + ' 个域名的 DNS 吗？\n' + names.join('\n'))) return;
+  pywebview.api.bind_dns_bulk(names).then(r => { alert(r.message); refreshDomainPage(); });
 }
 
 function refreshDomains() { refreshDomainPage(); }
@@ -314,5 +334,14 @@ async function sidebarStart() {
 }
 
 // ═══ Init ═══════════════════════════════════════════
-refreshDashboard();
-refreshStatusBar();
+function initApp() {
+  refreshDashboard();
+  refreshStatusBar();
+  pywebview.api.check_running_processes();
+}
+
+if (window.pywebview && window.pywebview.api) {
+  initApp();
+} else {
+  window.addEventListener('pywebviewready', initApp);
+}

@@ -127,10 +127,17 @@
       <h2>当前配置</h2>
       <div class="kv-row">
         <span class="kv-k">隧道</span>
-        <span class="kv-v muted" id="config-tunnel">未设置</span>
+        <span class="kv-v" id="config-tunnel">未设置</span>
+        <span class="kv-k">隧道 ID</span>
+        <span class="kv-v muted" id="config-tunnel-id"></span>
+      </div>
+      <div class="kv-row">
         <span class="kv-k">配置文件</span>
         <span class="kv-v muted" id="config-status">未创建</span>
       </div>
+      <p class="hint" style="margin-top:8px;color:#8b949e;font-size:12px">
+        提示：切换隧道后，已有域名需要重新「绑定 DNS」才能解析到新隧道
+      </p>
     </div>
 
     <div class="card">
@@ -148,7 +155,8 @@
         <div class="btn-group">
           <button class="btn sm ghost" onclick="refreshDomains()">刷新</button>
           <button class="btn sm danger" onclick="deleteDomainRule()">删除选中</button>
-          <button class="btn sm" onclick="bindDns()">绑定 DNS</button>
+          <button class="btn sm" onclick="bindDnsSelected()">绑定 DNS</button>
+          <button class="btn sm ghost" onclick="selectAllDomains()">全选</button>
         </div>
       </div>
       <div class="tbl-wrap">

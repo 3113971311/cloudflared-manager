@@ -187,20 +187,22 @@ def get_tunnel_info(name_or_id):
 
 
 def route_dns(tunnel_name, hostname):
-    """绑定 DNS 记录"""
+    """绑定 DNS 记录，--overwrite-dns 允许覆盖已有解析"""
     code, stdout, stderr = _run(
-        ["tunnel", "route", "dns", tunnel_name, hostname], timeout=30
+        ["tunnel", "route", "dns", "--overwrite-dns", tunnel_name, hostname], timeout=30
     )
     if code != 0:
         return False, stderr
     return True, stdout.strip()
 
 
-def list_routes():
-    """列出所有已绑定的 DNS 路由"""
-    code, stdout, stderr = _run(["tunnel", "route", "dns"], timeout=15)
+def list_routes_for_tunnel(tunnel_name):
+    """列出指定隧道的 DNS 路由，返回 [{"hostname": str}]"""
+    code, stdout, stderr = _run(
+        ["tunnel", "route", "dns", "show", tunnel_name], timeout=15
+    )
     if code != 0:
-        return [], stderr
+        return []
 
     routes = []
     lines = stdout.strip().split("\n")
@@ -208,19 +210,37 @@ def list_routes():
         line = line.strip()
         if not line or line.startswith("ID") or line.startswith("--"):
             continue
-        # 尝试匹配 UUID hostname 格式
         parts = line.split()
         if len(parts) >= 2:
-            routes.append(parts)
-    return routes, None
+            routes.append({"hostname": parts[-1]})
+    return routes
+
+
+def list_all_dns_routes(tunnel_names):
+    """列出所有隧道的 DNS 路由，返回 {hostname: tunnel_name}"""
+    result = {}
+    for name in tunnel_names:
+        for route in list_routes_for_tunnel(name):
+            result[route["hostname"]] = name
+    return result
 
 
 def unroute_dns(tunnel_id, hostname=""):
-    """解绑 DNS 记录"""
+    """解绑 DNS 记录（tunnel_id 为路由 ID）"""
     args = ["tunnel", "route", "dns", "delete", tunnel_id]
     if hostname:
         args.append(hostname)
     code, stdout, stderr = _run(args, timeout=30)
+    if code != 0:
+        return False, stderr
+    return True, stdout.strip()
+
+
+def delete_dns_record(tunnel_name, hostname):
+    """删除指定隧道上的 DNS 解析记录（tunnel_name 为隧道名/ID）"""
+    code, stdout, stderr = _run(
+        ["tunnel", "route", "dns", "delete", tunnel_name, hostname], timeout=30
+    )
     if code != 0:
         return False, stderr
     return True, stdout.strip()

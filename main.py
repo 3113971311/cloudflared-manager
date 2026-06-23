@@ -7,6 +7,7 @@ import threading
 import queue
 import subprocess
 import json
+import re
 import ctypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -25,7 +26,7 @@ def native_confirm(title, message):
 from core.cloudflared_cli import (
     is_installed, is_logged_in, get_version, login,
     list_tunnels, create_tunnel, delete_tunnel,
-    route_dns, _find_exe,
+    route_dns, delete_dns_record, list_all_dns_routes, _find_exe,
 )
 from core.config_manager import (
     load_config, get_tunnel_id_from_config,
@@ -38,6 +39,7 @@ from core.scheduler import (
 
 # ─── 全局状态 ────────────────────────────────
 tunnel_proc = None
+external_process = False  # 是否是外部启动的进程（如开机自启）
 log_lines = []
 log_lines_lock = threading.Lock()
 running_state = "stopped"
@@ -121,15 +123,61 @@ class Api:
         config = load_config()
         tid = get_tunnel_id_from_config()
         rules = get_ingress_rules()
-        return {"current_tunnel": tid or "", "has_config": config is not None, "rules": rules}
+        # 查找当前隧道名
+        tunnel_name = ""
+        if tid:
+            tunnels, _ = list_tunnels()
+            for t in tunnels:
+                if t["id"] == tid:
+                    tunnel_name = t["name"]
+                    break
+
+        return {
+            "current_tunnel": tid or "",
+            "current_tunnel_name": tunnel_name,
+            "has_config": config is not None,
+            "rules": rules,
+        }
 
     def add_rule(self, hostname, service):
         success, msg = add_ingress_rule(hostname, service)
         return {"success": success, "message": msg}
 
-    def delete_rule(self, hostname):
+    def delete_rule(self, hostname, also_delete_dns=False):
+        if also_delete_dns:
+            self._try_delete_dns(hostname)
         success, msg = remove_ingress_rule(hostname)
         return {"success": success, "message": msg}
+
+    def delete_dns(self, hostname):
+        """单独删除 DNS 解析记录"""
+        result = self._try_delete_dns(hostname)
+        return result
+
+    def _try_delete_dns(self, hostname):
+        """尝试删除 DNS 解析，优先精确查找所属隧道"""
+        tunnels, _ = list_tunnels()
+        if not tunnels:
+            return {"success": False, "message": "没有可用的隧道"}
+
+        # 先用 list_all_dns_routes 精确定位 DNS 所属隧道
+        dns_map = list_all_dns_routes([t["name"] for t in tunnels])
+        exact_tunnel = dns_map.get(hostname, "")
+
+        if exact_tunnel:
+            success, msg = delete_dns_record(exact_tunnel, hostname)
+            if success:
+                return {"success": True, "message": f"已删除 {hostname} 的 DNS 解析（隧道: {exact_tunnel}）"}
+
+        # 精确查找失败，遍历所有隧道尝试
+        for t in tunnels:
+            if t["name"] == exact_tunnel:
+                continue
+            success, msg = delete_dns_record(t["name"], hostname)
+            if success:
+                return {"success": True, "message": f"已删除 {hostname} 的 DNS 解析（隧道: {t['name']}）"}
+
+        return {"success": False, "message": "未找到该域名的 DNS 解析记录，可能已被删除或需手动清理"}
 
     def bind_dns(self, hostname):
         tunnels, _ = list_tunnels()
@@ -144,7 +192,37 @@ class Api:
         if not tunnel_name:
             tunnel_name = tunnels[0]["name"]
         success, msg = route_dns(tunnel_name, hostname)
+        if success and not msg:
+            msg = f"DNS 绑定成功：{hostname} → {tunnel_name}"
         return {"success": success, "message": msg}
+
+    def bind_dns_bulk(self, hostnames):
+        """批量绑定 DNS"""
+        tunnels, _ = list_tunnels()
+        if not tunnels:
+            return {"success": False, "message": "请先创建隧道"}
+        config_tid = get_tunnel_id_from_config()
+        tunnel_name = None
+        for t in tunnels:
+            if t["id"] == config_tid:
+                tunnel_name = t["name"]
+                break
+        if not tunnel_name:
+            tunnel_name = tunnels[0]["name"]
+
+        ok, fail = [], []
+        for h in hostnames:
+            success, msg = route_dns(tunnel_name, h)
+            if success:
+                ok.append(h)
+            else:
+                fail.append(f"{h}: {msg[:60]}")
+        parts = []
+        if ok:
+            parts.append(f"成功绑定 {len(ok)} 个：{', '.join(ok)}")
+        if fail:
+            parts.append(f"失败 {len(fail)} 个：{' | '.join(fail)}")
+        return {"success": len(fail) == 0, "message": '\n'.join(parts)}
 
     def get_autostart(self):
         exists, status = get_task_status()
@@ -217,6 +295,7 @@ class Api:
                 push_log(f"[ERROR] 启动异常: {e}")
             finally:
                 tunnel_proc = None
+                external_process = False
                 running_state = "stopped"
                 push_state("stopped")
 
@@ -224,56 +303,71 @@ class Api:
         return {"success": True, "message": "启动中..."}
 
     def stop_tunnel(self):
-        global tunnel_proc, running_state
-        if running_state in ("starting", "running"):
-            running_state = "stopping"
-            push_state("stopping")
-            push_log("--- 正在停止隧道... ---")
+        global tunnel_proc, running_state, external_process
+        if running_state not in ("starting", "running"):
+            return {"success": True}
+        running_state = "stopping"
+        push_state("stopping")
+        push_log("--- 正在停止隧道... ---")
+
+        # 外部进程（如开机自启启动的），用 taskkill
+        if external_process and (not tunnel_proc or tunnel_proc.poll() is not None):
+            self._taskkill_cloudflared()
+            external_process = False
+            running_state = "stopped"
+            push_state("stopped")
+            return {"success": True}
+
+        if tunnel_proc and tunnel_proc.poll() is None:
+            try:
+                tunnel_proc.terminate()
+            except Exception:
+                pass
+        # 3秒后强杀
+        def force_kill():
+            global tunnel_proc, running_state, external_process
             if tunnel_proc and tunnel_proc.poll() is None:
                 try:
-                    tunnel_proc.terminate()
+                    tunnel_proc.kill()
+                    push_log("--- 强制终止隧道进程 ---")
                 except Exception:
                     pass
-            # 3秒后强杀
-            def force_kill():
-                global tunnel_proc, running_state
-                if tunnel_proc and tunnel_proc.poll() is None:
-                    try:
-                        tunnel_proc.kill()
-                        push_log("--- 强制终止隧道进程 ---")
-                    except Exception:
-                        pass
-                running_state = "stopped"
-                push_state("stopped")
-            threading.Timer(3, force_kill).start()
+            running_state = "stopped"
+            external_process = False
+            push_state("stopped")
+        threading.Timer(3, force_kill).start()
         return {"success": True}
+
+    def _taskkill_cloudflared(self):
+        """使用 taskkill 终止 cloudflared 进程"""
+        try:
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = subprocess.SW_HIDE
+            subprocess.run(
+                ["taskkill", "/F", "/IM", "cloudflared.exe"],
+                capture_output=True, text=True, timeout=15,
+                startupinfo=si, creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            push_log("--- 已终止外部 cloudflared 进程 ---")
+        except Exception:
+            pass
 
     def confirm_kill(self):
         """弹出原生确认对话框"""
         return native_confirm("停止所有隧道", "确定要停止所有 cloudflared 隧道进程吗？")
 
     def kill_all(self):
-        global tunnel_proc, running_state
+        global tunnel_proc, running_state, external_process
         push_log("========== 停止所有隧道 ==========")
         if tunnel_proc and tunnel_proc.poll() is None:
             try:
                 tunnel_proc.terminate()
             except Exception:
                 pass
-        try:
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = subprocess.SW_HIDE
-            subprocess.run(
-                ["taskkill", "/F", "/IM", "cloudflared.exe"],
-                capture_output=True, text=True, timeout=15,
-                startupinfo=startupinfo,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            push_log("--- 已强制终止所有 cloudflared 进程 ---")
-        except Exception:
-            pass
+        self._taskkill_cloudflared()
         tunnel_proc = None
+        external_process = False
         running_state = "stopped"
         push_state("stopped")
         return {"success": True}
@@ -288,6 +382,47 @@ class Api:
     def get_state(self):
         return {"state": running_state}
 
+    def check_running_processes(self):
+        """启动时检测是否有外部 tunnel 进程在运行（如开机自启启动的）"""
+        global running_state
+        if running_state != "stopped":
+            return {"running": True, "state": running_state}
+        try:
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = subprocess.SW_HIDE
+            result = subprocess.run(
+                ['tasklist', '/FI', 'IMAGENAME eq cloudflared.exe', '/NH'],
+                capture_output=True, text=True, timeout=5,
+                startupinfo=si, creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            if 'cloudflared.exe' in result.stdout:
+                # 尝试从进程命令行解析隧道名
+                tunnel_name = ""
+                try:
+                    ps = subprocess.run(
+                        ['powershell', '-NoProfile', '-Command',
+                         '(Get-CimInstance Win32_Process -Filter "Name=\'cloudflared.exe\'").CommandLine'],
+                        capture_output=True, text=True, timeout=8,
+                        startupinfo=si, creationflags=subprocess.CREATE_NO_WINDOW
+                    )
+                    m = re.search(r'run\s+(\S+)', ps.stdout)
+                    if m:
+                        tunnel_name = m.group(1)
+                except Exception:
+                    pass
+
+                running_state = "running"
+                external_process = True
+                push_state("running")
+                push_log(f"[检测] 发现已在运行的 cloudflared 隧道进程"
+                         + (f" ({tunnel_name})" if tunnel_name else ""))
+                return {"running": True, "state": "running",
+                        "external": True, "tunnel_name": tunnel_name}
+        except Exception:
+            pass
+        return {"running": False, "state": "stopped"}
+
 
 # ─── HTML 文件查找（兼容 PyInstaller） ────────────
 def get_web_path():
@@ -298,6 +433,11 @@ def get_web_path():
 
 # ─── 入口 ────────────────────────────────────
 def main():
+    # 指定 WebView2 用户数据目录（避免临时目录被清理导致无法启动）
+    webview_data = os.path.join(os.environ['LOCALAPPDATA'], '寒彬Cloudflared管理', 'WebView2')
+    os.makedirs(webview_data, exist_ok=True)
+    os.environ['WEBVIEW2_USER_DATA_FOLDER'] = webview_data
+
     api = Api()
     web_path = get_web_path()
     html_path = os.path.join(web_path, 'index.html')
